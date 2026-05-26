@@ -35,6 +35,11 @@ function extractSystemFromOpenAIMessages(
 function parseOpenAIContent(
   content: OpenAI.Chat.ChatCompletionMessageParam["content"],
 ): UniversalContent[] {
+  // null/undefined content is common for assistant messages with tool_calls
+  if (content === null || content === undefined) {
+    return []
+  }
+
   if (typeof content === "string") {
     return [
       {
@@ -80,6 +85,17 @@ function parseOpenAIContent(
         }
       }
 
+      if (part.type === "input_audio") {
+        return {
+          _original: { provider: "openai", raw: part },
+          media: {
+            data: (part as any).input_audio.data,
+            mimeType: `audio/${(part as any).input_audio.format || "wav"}`,
+          },
+          type: "audio" as const,
+        }
+      }
+
       // Fallback for unknown content types
       return {
         _original: { provider: "openai", raw: part },
@@ -89,10 +105,11 @@ function parseOpenAIContent(
     })
   }
 
+  // Unknown content type — preserve as JSON text
   return [
     {
       _original: { provider: "openai", raw: content },
-      text: JSON.stringify(content),
+      text: JSON.stringify(content) || "",
       type: "text",
     },
   ]
@@ -101,14 +118,25 @@ function parseOpenAIContent(
 function parseOpenAIToolCalls(
   tool_calls: OpenAI.Chat.ChatCompletionMessageToolCall[],
 ): UniversalToolCall[] {
-  return tool_calls.map((tc) => ({
-    arguments: JSON.parse(tc.function.arguments),
-    id: tc.id,
-    metadata: {
-      type: tc.type,
-    },
-    name: tc.function.name,
-  }))
+  return tool_calls.map((tc) => {
+    let args: Record<string, unknown> = {}
+    let parseFailed = false
+    try {
+      args = JSON.parse(tc.function.arguments)
+    } catch {
+      // Malformed JSON arguments — preserve as raw string in metadata
+      parseFailed = true
+    }
+    return {
+      arguments: args,
+      id: tc.id,
+      metadata: {
+        type: tc.type,
+        ...(parseFailed ? { raw_arguments: tc.function.arguments } : {}),
+      },
+      name: tc.function.name,
+    }
+  })
 }
 
 export function openaiToUniversal(body: OpenAIBody): UniversalBody<"openai"> {
@@ -142,10 +170,28 @@ export function openaiToUniversal(body: OpenAIBody): UniversalBody<"openai"> {
         baseMessage.tool_calls = parseOpenAIToolCalls(msg.tool_calls)
       }
 
-      // Handle tool responses
+      // Handle tool responses - convert to tool_result content
       if (msg.role === "tool") {
-        const toolMsg = msg as OpenAI.Chat.ChatCompletionToolMessageParam
+        const toolMsg = msg as any // OpenAI.Chat.ChatCompletionToolMessageParam
         baseMessage.metadata.tool_call_id = toolMsg.tool_call_id
+        baseMessage.metadata.name = toolMsg.name
+
+        // Convert content to tool_result format
+        const contentString = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)
+        baseMessage.content = [
+          {
+            type: "tool_result",
+            tool_result: {
+              tool_call_id: toolMsg.tool_call_id,
+              name: toolMsg.name || "",
+              result: contentString,
+            },
+            _original: {
+              provider: "openai",
+              raw: msg.content,
+            },
+          },
+        ]
       }
 
       return baseMessage
@@ -158,6 +204,7 @@ export function openaiToUniversal(body: OpenAIBody): UniversalBody<"openai"> {
       description: tool.function.description || "",
       metadata: {
         type: tool.type,
+        strict: (tool.function as any).strict,
       },
       name: tool.function.name,
       parameters: tool.function.parameters || {},
@@ -173,11 +220,23 @@ export function openaiToUniversal(body: OpenAIBody): UniversalBody<"openai"> {
     provider: "openai",
     provider_params: {
       logprobs: body.logprobs ?? undefined,
+      reasoning_effort: (body as any).reasoning_effort ?? undefined,
       response_format: body.response_format ?? undefined,
       top_logprobs: body.top_logprobs ?? undefined,
+      verbosity: (body as any).verbosity ?? undefined,
+      parallel_tool_calls: (body as any).parallel_tool_calls ?? undefined,
     },
+    reasoning_effort: (body as any).reasoning_effort ?? undefined,
     seed: body.seed ?? undefined,
     stream: body.stream ?? undefined,
+    structured_output: body.response_format?.type === "json_schema"
+      ? {
+          type: "json_schema" as const,
+          json_schema: (body.response_format as any).json_schema,
+        }
+      : body.response_format?.type === "json_object"
+      ? { type: "json_object" as const }
+      : undefined,
     system: systemPrompt,
     temperature: body.temperature ?? undefined,
     tool_choice: body.tool_choice as any,
@@ -201,7 +260,7 @@ function hasMessagesBeenModified(universal: UniversalBody<"openai">): boolean {
   // Check if any messages have contextInjection metadata (indicates injection)
   const hasInjectedMessages = universal.messages.some(m => 
     m.metadata.contextInjection || 
-    !m.metadata.originalIndex // New messages without originalIndex
+    m.metadata.originalIndex === undefined // New messages without originalIndex
   )
   
   return hasInjectedMessages
@@ -248,25 +307,46 @@ export function universalToOpenAI(
       role: msg.role as any,
     }
 
+    // Filter out thinking/redacted_thinking content (OpenAI Chat Completions doesn't support thinking blocks)
+    const filteredContent = msg.content.filter(
+      (c) => c.type !== "thinking" && c.type !== "redacted_thinking"
+    )
+
     // 🎯 CONTENT BACKFILL: Use original content structure when available
     if (
-      msg.content.length === 1 &&
-      msg.content[0]?._original?.provider === "openai"
+      filteredContent.length === 1 &&
+      filteredContent[0]?._original?.provider === "openai"
     ) {
       // Perfect reconstruction from original - but only if it's valid OpenAI content
-      const originalContent = msg.content[0]?._original?.raw
-      if (originalContent) {
-        openaiMessage.content = originalContent as any
+      const originalContent = filteredContent[0]?._original?.raw
+      if (originalContent !== null && originalContent !== undefined) {
+        if (typeof originalContent === "string") {
+          openaiMessage.content = originalContent
+        } 
+        else if (Array.isArray(originalContent)) {
+          openaiMessage.content = originalContent as any
+        } 
+        else if (typeof originalContent === "object" && originalContent !== null) {
+          openaiMessage.content = [originalContent] as any
+        } 
+        // Fallback to universal format if original is not valid OpenAI content
+        else {
+          openaiMessage.content = filteredContent[0]?.text || ""
+        }
       } else {
         // Fallback to universal format if original is not valid OpenAI content
-        openaiMessage.content = msg.content[0]?.text || ""
+        openaiMessage.content = filteredContent[0]?.text || ""
       }
-    } else if (msg.content.length === 1 && msg.content[0]?.type === "text") {
+    } else if (filteredContent.length === 1 && filteredContent[0]?.type === "text") {
       // Simple text message
-      openaiMessage.content = msg.content[0]?.text || ""
+      openaiMessage.content = filteredContent[0]?.text || ""
+    } else if (filteredContent.length === 1 && filteredContent[0]?.type === "tool_result") {
+      // Tool result content - OpenAI expects string content for tool messages
+      const result = filteredContent[0]?.tool_result?.result
+      openaiMessage.content = typeof result === "string" ? result : JSON.stringify(result)
     } else {
       // Complex content - reconstruct each part
-      openaiMessage.content = msg.content.map((content) => {
+      openaiMessage.content = filteredContent.map((content) => {
         // 🎯 PER-CONTENT BACKFILL: Use original structure if available
         if (content._original?.provider === "openai") {
           return content._original?.raw as OpenAI.Chat.ChatCompletionContentPart
@@ -280,12 +360,26 @@ export function universalToOpenAI(
           }
         }
         if (content.type === "image") {
+          // Reconstruct data URL from base64 if no URL is available
+          const imageUrl = content.media?.url
+            || (content.media?.data && content.media?.mimeType
+              ? `data:${content.media.mimeType};base64,${content.media.data}`
+              : content.media?.data || "")
           return {
             image_url: {
               detail: content.media?.detail,
-              url: content.media?.url,
+              url: imageUrl,
             },
             type: "image_url",
+          }
+        }
+        if (content.type === "audio") {
+          return {
+            input_audio: {
+              data: content.media?.data || "",
+              format: content.media?.mimeType?.split("/")[1] || "wav",
+            },
+            type: "input_audio",
           }
         }
 
@@ -298,40 +392,39 @@ export function universalToOpenAI(
     }
 
     // 🎯 TOOL CALLS BACKFILL: Handle tool calls with original preservation
-    if (msg.tool_calls) {
-      ;(openaiMessage as any).tool_calls = msg.tool_calls.map((tc) => {
-        // Check if we have original tool call data
-        if (
-          tc.metadata &&
-          "type" in tc.metadata &&
-          tc.metadata.type === "function"
-        ) {
-          return {
-            function: {
-              arguments: JSON.stringify(tc.arguments),
-              name: tc.name,
-            },
-            id: tc.id,
-            type: "function",
-          }
-        }
-
-        // Fallback to universal format
-        return {
-          function: {
-            arguments: JSON.stringify(tc.arguments),
-            name: tc.name,
-          },
-          id: tc.id,
-          type: "function",
-        }
-      })
+    // Also extract tool_calls from content blocks (cross-provider: Google/Anthropic store them in content)
+    const contentToolCalls = msg.content
+      .filter(c => c.type === "tool_call" && c.tool_call)
+      .map(c => c.tool_call!)
+    const allToolCalls = [
+      ...(msg.tool_calls || []),
+      ...contentToolCalls,
+    ]
+    if (allToolCalls.length > 0) {
+      // OpenAI requires content: null for assistant messages with tool_calls
+      if (!openaiMessage.content || (Array.isArray(openaiMessage.content) && openaiMessage.content.length === 0)) {
+        openaiMessage.content = null as any
+      }
+      ;(openaiMessage as any).tool_calls = allToolCalls.map((tc) => ({
+        function: {
+          arguments: JSON.stringify(tc.arguments),
+          name: tc.name,
+        },
+        id: tc.id,
+        type: "function",
+      }))
     }
 
     // 🎯 METADATA BACKFILL: Restore OpenAI-specific fields
     if (msg.role === "tool") {
-      ;(openaiMessage as any).name = msg.metadata.name
+      // tool_call_id can come from metadata or from the tool_result content
+      const toolResult = msg.content.find(c => c.type === "tool_result")
       ;(openaiMessage as any).tool_call_id = msg.metadata.tool_call_id
+        || toolResult?.tool_result?.tool_call_id
+        || ""
+      if (msg.metadata.name || toolResult?.tool_result?.name) {
+        ;(openaiMessage as any).name = msg.metadata.name || toolResult?.tool_result?.name
+      }
     }
 
     messages.push(openaiMessage)
@@ -352,9 +445,10 @@ export function universalToOpenAI(
           description: tool.description,
           name: tool.name,
           parameters: tool.parameters,
+          strict: tool.metadata?.strict,
         },
         type: "function",
-      }
+      } as OpenAI.Chat.ChatCompletionTool
     })
   }
 
@@ -388,6 +482,32 @@ export function universalToOpenAI(
     }
     if (universal.provider_params.top_logprobs !== undefined) {
       result.top_logprobs = universal.provider_params.top_logprobs
+    }
+    if (universal.provider_params.reasoning_effort !== undefined) {
+      (result as any).reasoning_effort = universal.provider_params.reasoning_effort
+    }
+    if (universal.provider_params.verbosity !== undefined) {
+      (result as any).verbosity = universal.provider_params.verbosity
+    }
+    if (universal.provider_params.parallel_tool_calls !== undefined) {
+      (result as any).parallel_tool_calls = universal.provider_params.parallel_tool_calls
+    }
+  }
+
+  // Write back reasoning_effort from top-level if set and not already written from provider_params
+  if (universal.reasoning_effort !== undefined && !(result as any).reasoning_effort) {
+    (result as any).reasoning_effort = universal.reasoning_effort
+  }
+
+  // 🎯 STRUCTURED OUTPUT: Reconstruct response_format from structured_output if not already set
+  if (universal.structured_output && !result.response_format) {
+    if (universal.structured_output.type === "json_schema" && universal.structured_output.json_schema) {
+      result.response_format = {
+        type: "json_schema",
+        json_schema: universal.structured_output.json_schema,
+      } as any
+    } else if (universal.structured_output.type === "json_object") {
+      result.response_format = { type: "json_object" } as any
     }
   }
 

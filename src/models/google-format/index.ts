@@ -8,10 +8,52 @@ import {
   UniversalTool,
 } from "../../types/universal"
 
+// Gemini only supports a subset of JSON Schema. Strip fields it rejects.
+const UNSUPPORTED_SCHEMA_KEYS = new Set([
+  "$schema", "$id", "$ref", "$comment", "$defs", "definitions",
+  "additionalProperties", "patternProperties", "propertyNames", "unevaluatedProperties",
+  "const", "oneOf", "allOf", "not", "prefixItems",
+  "if", "then", "else",
+  "exclusiveMinimum", "exclusiveMaximum",
+  "dependentSchemas", "dependentRequired",
+  "contentEncoding", "contentMediaType", "contentSchema",
+  "deprecated", "readOnly", "writeOnly", "examples", "default",
+])
+
+function stripUnsupportedSchemaFields(obj: unknown): unknown {
+  if (Array.isArray(obj)) return obj.map(stripUnsupportedSchemaFields)
+  if (obj && typeof obj === "object") {
+    const out: Record<string, unknown> = {}
+    for (const [k, v] of Object.entries(obj)) {
+      if (!UNSUPPORTED_SCHEMA_KEYS.has(k)) {
+        out[k] = stripUnsupportedSchemaFields(v)
+      }
+    }
+    return out
+  }
+  return obj
+}
+
+function mapThinkingLevel(level: string | undefined): "low" | "medium" | "high" | undefined {
+  if (!level) return undefined
+  if (level === "minimal" || level === "low") return "low"
+  if (level === "medium") return "medium"
+  if (level === "high") return "high"
+  return undefined
+}
+
 function parseGoogleContent(parts: any[]): UniversalContent[] {
   if (!parts) return []
 
   return parts.map((part) => {
+    // Handle thought parts before regular text
+    if (part.thought === true && part.text) {
+      return {
+        _original: { provider: "google", raw: part },
+        thinking: part.text,
+        type: "thinking" as const,
+      }
+    }
     if (part.text) {
       return {
         _original: { provider: "google", raw: part },
@@ -27,6 +69,7 @@ function parseGoogleContent(parts: any[]): UniversalContent[] {
           media: {
             data: part.inlineData.data,
             mimeType: mimeType,
+            ...(part.inlineData.displayName ? { fileName: part.inlineData.displayName } : {}),
           },
           type: "image" as const,
         }
@@ -37,6 +80,7 @@ function parseGoogleContent(parts: any[]): UniversalContent[] {
           media: {
             data: part.inlineData.data,
             mimeType: mimeType,
+            ...(part.inlineData.displayName ? { fileName: part.inlineData.displayName } : {}),
           },
           type: "audio" as const,
         }
@@ -47,6 +91,7 @@ function parseGoogleContent(parts: any[]): UniversalContent[] {
           media: {
             data: part.inlineData.data,
             mimeType: mimeType,
+            ...(part.inlineData.displayName ? { fileName: part.inlineData.displayName } : {}),
           },
           type: "video" as const,
         }
@@ -56,7 +101,7 @@ function parseGoogleContent(parts: any[]): UniversalContent[] {
           _original: { provider: "google", raw: part },
           media: {
             data: part.inlineData.data,
-            fileName: part.fileName || "document.pdf",
+            fileName: part.inlineData.displayName || part.fileName || "document.pdf",
             mimeType: mimeType,
           },
           type: "document" as const,
@@ -77,7 +122,7 @@ function parseGoogleContent(parts: any[]): UniversalContent[] {
         _original: { provider: "google", raw: part },
         tool_call: {
           arguments: part.functionCall.args,
-          id: `call_${Date.now()}`,
+          id: part.functionCall.id || generateId(),
           metadata: {
             args: part.functionCall.args,
           },
@@ -91,7 +136,7 @@ function parseGoogleContent(parts: any[]): UniversalContent[] {
         tool_result: {
           name: part.functionResponse.name,
           result: part.functionResponse.response,
-          tool_call_id: `call_${part.functionResponse.name}`, // Google doesn't provide call IDs
+          tool_call_id: part.functionResponse.id || `call_${part.functionResponse.name}`,
           metadata: {
             response: part.functionResponse.response,
           },
@@ -125,7 +170,7 @@ export function googleToUniversal(body: GeminiBody): UniversalBody<"google"> {
 
   // Extract tools from function declarations
   const tools: UniversalTool[] = []
-  if (body.tools) {
+  if (body.tools && Array.isArray(body.tools)) {
     for (const tool of body.tools) {
       if ("functionDeclarations" in tool && tool.functionDeclarations) {
         for (const fn of tool.functionDeclarations) {
@@ -149,7 +194,7 @@ export function googleToUniversal(body: GeminiBody): UniversalBody<"google"> {
     body.systemInstruction &&
     typeof body.systemInstruction === "object" &&
     "parts" in body.systemInstruction &&
-    body.systemInstruction.parts
+    Array.isArray(body.systemInstruction.parts)
   ) {
     systemPrompt = body.systemInstruction.parts
       .filter((part: any) => part.text)
@@ -157,19 +202,54 @@ export function googleToUniversal(body: GeminiBody): UniversalBody<"google"> {
       .join(" ")
   }
 
+  // Parse thinking config (nested inside generationConfig per Gemini API)
+  const thinkingConfig = (body.generationConfig as any)?.thinkingConfig
+    || (body as any).thinkingConfig // fallback for old top-level format
+  const thinking = thinkingConfig
+    ? {
+        enabled: true,
+        budget_tokens: thinkingConfig.thinkingBudget,
+        effort: mapThinkingLevel(thinkingConfig.thinkingLevel),
+      }
+    : undefined
+
+  // Parse structured output from responseMimeType/responseSchema
+  const structured_output =
+    body.generationConfig?.responseMimeType === "application/json" && body.generationConfig?.responseSchema
+      ? {
+          type: "json_schema" as const,
+          json_schema: {
+            name: "response",
+            schema: body.generationConfig.responseSchema as Record<string, unknown>,
+          },
+        }
+      : body.generationConfig?.responseMimeType === "application/json"
+      ? { type: "json_object" as const }
+      : undefined
+
+  // Detect built-in tools
+  const builtinTools = body.tools && Array.isArray(body.tools)
+    ? body.tools.filter((t: any) =>
+        'urlContext' in t || 'googleSearch' in t || 'codeExecution' in t
+      )
+    : undefined
+
   return {
     _original: { provider: "google", raw: body },
     max_tokens: body.generationConfig?.maxOutputTokens,
     messages: universalMessages,
-    model: "gemini-pro", // Google doesn't always include model in request
+    model: (body as any).model || "gemini-pro",
     provider: "google",
     provider_params: {
       generation_config: body.generationConfig,
-      safety_settings: body.safetySettings,
+      ...(body.safetySettings ? { safety_settings: body.safetySettings } : {}),
+      ...(builtinTools && builtinTools.length > 0 ? { builtin_tools: builtinTools } : {}),
     },
     stream: false,
+    structured_output,
     system: systemPrompt, // Streaming is handled differently in Google
     temperature: body.generationConfig?.temperature,
+    thinking,
     tool_choice:
       body.toolConfig?.functionCallingConfig?.mode?.toLowerCase() as any,
     tools: tools.length > 0 ? tools : undefined,
@@ -179,19 +259,19 @@ export function googleToUniversal(body: GeminiBody): UniversalBody<"google"> {
 
 function hasMessagesBeenModified(universal: UniversalBody<"google">): boolean {
   if (!universal._original?.raw) return true
-  
+
   const originalBody = universal._original.raw as GeminiBody
   const originalMessages = originalBody.contents || []
-  
+
   // Check if message count changed
   if (originalMessages.length !== universal.messages.length) return true
-  
+
   // Check if any messages have contextInjection metadata (indicates injection)
-  const hasInjectedMessages = universal.messages.some(m => 
-    m.metadata.contextInjection || 
-    !m.metadata.originalIndex // New messages without originalIndex
+  const hasInjectedMessages = universal.messages.some(m =>
+    m.metadata.contextInjection ||
+    m.metadata.originalIndex === undefined // New messages without originalIndex
   )
-  
+
   return hasInjectedMessages
 }
 
@@ -203,31 +283,43 @@ export function universalToGoogle(
     return universal._original.raw as GeminiBody
   }
 
-  // Separate system messages from regular messages
+  // Separate system and developer messages from regular messages
   const systemMessages = universal.messages.filter(msg => msg.role === "system")
-  const regularMessages = universal.messages.filter(msg => msg.role !== "system")
+  const developerMessages = universal.messages.filter(msg => msg.role === "developer")
+  const regularMessages = universal.messages.filter(msg => msg.role !== "system" && msg.role !== "developer")
+
+  // Build tool_call_id -> name lookup (Anthropic tool_results lack the name)
+  const toolNameMap = new Map<string, string>()
+  for (const msg of regularMessages) {
+    for (const c of msg.content) {
+      if (c.type === "tool_call" && c.tool_call) {
+        toolNameMap.set(c.tool_call.id, c.tool_call.name)
+      }
+    }
+  }
 
   // Convert universal messages back to Google format
   const contents = regularMessages.map((msg) => ({
     parts: msg.content.map((content) => {
       if (content._original?.provider === "google") {
-        // Validate that _original.raw is properly formatted for Google
+        // Try to use the original format if it's valid for Google
         const originalRaw = content._original.raw
-        if (typeof originalRaw === 'string') {
-          throw new Error(
-            `Invalid _original.raw format for Google provider. Expected object with 'text' property, got string: "${originalRaw}". ` +
-            `Remove the _original field and let the library auto-generate it, or use format: { text: "${originalRaw}" }`
-          )
-        }
         if (typeof originalRaw === 'object' && originalRaw !== null && 'text' in originalRaw) {
           return originalRaw
         }
-        // If _original.raw exists but is not valid, throw error
-        throw new Error(
-          `Invalid _original.raw format for Google provider. Expected object with 'text' property, got: ${JSON.stringify(originalRaw)}`
-        )
+        // If _original.raw is not in the expected Google format (e.g., it's a string or invalid object),
+        // gracefully fall through to generate the format from the universal content
+        // This handles cases where context injection creates _original fields with string values
       }
 
+      // Handle thinking content before text
+      if (content.type === "thinking") {
+        return { thought: true, text: content.thinking || "" }
+      }
+      if (content.type === "redacted_thinking") {
+        // Redacted thinking can't be reconstructed; emit an empty thought marker
+        return { thought: true, text: "" }
+      }
       if (content.type === "text") {
         return { text: content.text }
       }
@@ -236,6 +328,7 @@ export function universalToGoogle(
           inlineData: {
             data: content.media!.data,
             mimeType: content.media!.mimeType || "image/jpeg",
+            ...(content.media?.fileName ? { displayName: content.media.fileName } : {}),
           },
         }
       }
@@ -244,6 +337,7 @@ export function universalToGoogle(
           inlineData: {
             data: content.media!.data,
             mimeType: content.media!.mimeType || "audio/mp3",
+            ...(content.media?.fileName ? { displayName: content.media.fileName } : {}),
           },
         }
       }
@@ -252,14 +346,25 @@ export function universalToGoogle(
           inlineData: {
             data: content.media!.data,
             mimeType: content.media!.mimeType || "video/mp4",
+            ...(content.media?.fileName ? { displayName: content.media.fileName } : {}),
           },
         }
       }
       if (content.type === "document") {
+        // Prefer fileData when a URI is available (e.g. Google Cloud Storage)
+        if (content.media?.fileUri) {
+          return {
+            fileData: {
+              fileUri: content.media.fileUri,
+              mimeType: content.media.mimeType || "application/pdf",
+            },
+          }
+        }
         return {
           inlineData: {
             data: content.media!.data,
             mimeType: content.media!.mimeType || "application/pdf",
+            ...(content.media?.fileName ? { displayName: content.media.fileName } : {}),
           },
         }
       }
@@ -272,10 +377,29 @@ export function universalToGoogle(
         }
       }
       if (content.type === "tool_result") {
+        // Gemini requires response to be a plain JSON object (protobuf Struct)
+        const raw = content.tool_result!.result
+        let response: Record<string, unknown>
+        if (typeof raw === "string") {
+          response = { output: raw }
+        } else if (Array.isArray(raw)) {
+          // Anthropic sends content block arrays — flatten text out
+          const text = raw
+            .map((b: any) => (typeof b === "string" ? b : b.text || JSON.stringify(b)))
+            .join("\n")
+          response = { output: text }
+        } else if (raw && typeof raw === "object") {
+          response = raw as Record<string, unknown>
+        } else {
+          response = { output: JSON.stringify(raw) }
+        }
+        const toolName = content.tool_result!.name
+          || toolNameMap.get(content.tool_result!.tool_call_id) || "unknown"
         return {
           functionResponse: {
-            name: content.tool_result!.name,
-            response: content.tool_result!.result,
+            id: content.tool_result!.tool_call_id,
+            name: toolName,
+            response,
           },
         }
       }
@@ -284,15 +408,35 @@ export function universalToGoogle(
       return { text: JSON.stringify(content) }
     }) as any,
     role: msg.role === "assistant" ? "model" : msg.role,
-  })) as any
+  }))
+
+  // Append message-level tool_calls as functionCall parts (cross-provider: OpenAI stores them at message level)
+  for (let i = 0; i < regularMessages.length; i++) {
+    const msg = regularMessages[i]
+    if (msg.tool_calls && msg.tool_calls.length > 0) {
+      const existingParts = contents[i]?.parts || []
+      // Only add if not already present in content (avoid duplicates)
+      if (!existingParts.some((p: any) => p.functionCall)) {
+        contents[i] = {
+          ...contents[i],
+          parts: [
+            ...existingParts,
+            ...msg.tool_calls.map((tc) => ({
+              functionCall: { id: tc.id, name: tc.name, args: tc.arguments },
+            })),
+          ],
+        }
+      }
+    }
+  }
 
   const result: GeminiBody = {
-    contents,
+    contents: contents as any,
   }
 
   // Add system instruction if present
   const systemParts: any[] = []
-  
+
   // Add system from universal.system field
   if (universal.system) {
     const systemContent =
@@ -302,7 +446,7 @@ export function universalToGoogle(
 
     systemParts.push({ text: systemContent })
   }
-  
+
   // Add system messages from messages array
   if (systemMessages.length > 0) {
     for (const systemMsg of systemMessages) {
@@ -314,7 +458,18 @@ export function universalToGoogle(
       }
     }
   }
-  
+
+  // Add developer messages to system parts (Google doesn't have a developer role)
+  if (developerMessages.length > 0) {
+    for (const devMsg of developerMessages) {
+      for (const content of devMsg.content) {
+        if (content.type === "text") {
+          systemParts.push({ text: content.text })
+        }
+      }
+    }
+  }
+
   if (systemParts.length > 0) {
     result.systemInstruction = {
       parts: systemParts,
@@ -346,7 +501,7 @@ export function universalToGoogle(
           return {
             description: tool.description,
             name: tool.name,
-            parameters: tool.parameters,
+            parameters: stripUnsupportedSchemaFields(tool.parameters),
           }
         }),
       },
@@ -366,6 +521,14 @@ export function universalToGoogle(
     }
   }
 
+  // Pass through built-in tools
+  if (universal.provider_params?.builtin_tools) {
+    result.tools = [
+      ...(result.tools || []),
+      ...(Array.isArray(universal.provider_params.builtin_tools) ? universal.provider_params.builtin_tools : []),
+    ]
+  }
+
   // Add provider-specific params
   if (universal.provider_params) {
     if (universal.provider_params.generation_config) {
@@ -377,6 +540,32 @@ export function universalToGoogle(
     if (universal.provider_params.safety_settings) {
       result.safetySettings = universal.provider_params.safety_settings as any
     }
+  }
+
+  // Write back thinking config (nested inside generationConfig)
+  // Gemini caps thinkingBudget at 24576 — clamp any larger value from other providers
+  if (universal.thinking?.enabled) {
+    const GEMINI_MAX_THINKING_BUDGET = 24576
+    result.generationConfig = {
+      ...result.generationConfig,
+      thinkingConfig: {
+        ...(universal.thinking.budget_tokens
+          ? { thinkingBudget: Math.min(universal.thinking.budget_tokens, GEMINI_MAX_THINKING_BUDGET) }
+          : {}),
+        ...(universal.thinking.effort ? { thinkingLevel: universal.thinking.effort } : {}),
+      },
+    } as any
+  }
+
+  // Write back structured output as responseMimeType/responseSchema
+  if (universal.structured_output) {
+    result.generationConfig = {
+      ...result.generationConfig,
+      responseMimeType: "application/json",
+      ...(universal.structured_output.json_schema?.schema
+        ? { responseSchema: universal.structured_output.json_schema.schema }
+        : {}),
+    } as any
   }
 
   return result
